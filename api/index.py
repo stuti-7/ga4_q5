@@ -33,10 +33,29 @@ KNOWN_ORGS = {
 }
 
 # entity span: sequences of Capitalized / camel-ish tokens, allowing lowercase
-# connector words like "of"/"for"/"and"/"the" in the middle (e.g. "Bank of America")
-ENTITY_RE = re.compile(
-    r"\b[A-Z][a-zA-Z0-9]*(?:\s+(?:of|for|and|the|&)\s+[A-Z][a-zA-Z0-9]*|\s+[A-Z][a-zA-Z0-9]*){0,4}\b"
-)
+# connector words like "of"/"for"/"the" in the middle (e.g. "Bank of America").
+# NOTE: "and" is deliberately excluded here -- it's far more often a list separator
+# between two DISTINCT entities ("Tesla and SpaceX") than part of one proper name,
+# so allowing it would wrongly merge separate entities into one bogus name.
+SINGLE_ENT_PATTERN = r"[A-Z][a-zA-Z0-9]*(?:\s+(?:of|for|the|&)\s+[A-Z][a-zA-Z0-9]*|\s+[A-Z][a-zA-Z0-9]*){0,4}"
+ENTITY_RE = re.compile(rf"\b{SINGLE_ENT_PATTERN}\b")
+
+
+def _list_entity_pattern(group_name: str) -> str:
+    """A comma/and-separated list of one or more entity phrases, e.g.
+    'Tesla, SpaceX and Neuralink', captured whole under the given group name."""
+    item = rf"(?:(?:(?i:the|a|an)\s+)?{SINGLE_ENT_PATTERN})"
+    return rf"(?P<{group_name}>{item}(?:\s*,\s*{item})*(?:\s*,?\s*(?i:and)\s*{item})?)"
+
+
+def _split_entity_list(text: str) -> list:
+    parts = re.split(r"\s*,\s*|\s+(?i:and)\s+", text.strip())
+    cleaned = []
+    for p in parts:
+        p = re.sub(r"^(?i:the|a|an)\s+", "", p.strip()).strip()
+        if p:
+            cleaned.append(p)
+    return cleaned
 
 # raw pattern strings: "ENT" is a placeholder later substituted with a case-sensitive
 # entity regex; trigger words are wrapped in (?i:...) so only THEY are case-insensitive
@@ -129,27 +148,29 @@ async def extract_graph(req: ExtractRequest):
 
     for pattern_str, relation in RELATION_PATTERNS:
         for m in re.finditer(_dual_entity_regex(pattern_str), text):
-            a = m.group("a").strip()
-            b = m.group("b").strip()
-            if not a or not b or a == b:
-                continue
-            key = (a, b, relation)
-            if key in seen_rel:
-                continue
-            seen_rel.add(key)
-            relationships.append({"source": b, "target": a, "relation": relation})
-            if relation == "HIRED":
-                ensure(b)["hirer"] += 1
-                ensure(a)["hired_person"] += 1
-            elif relation == "FOUNDED":
-                ensure(b)["agent_person_like"] += 1
-                ensure(a)["founded_org"] += 1
-            elif relation == "AUTHORED":
-                ensure(b)["agent_person_like"] += 1
-                ensure(a)["authored_work"] += 1
-            else:  # DEVELOPED, INTEGRATED_INTO
-                ensure(b)["agent_person_like"] += 1
-                ensure(a)["created_thing"] += 1
+            a_list = _split_entity_list(m.group("a"))
+            b_list = _split_entity_list(m.group("b"))
+            for b in b_list:
+                for a in a_list:
+                    if not a or not b or a == b:
+                        continue
+                    key = (a, b, relation)
+                    if key in seen_rel:
+                        continue
+                    seen_rel.add(key)
+                    relationships.append({"source": b, "target": a, "relation": relation})
+                    if relation == "HIRED":
+                        ensure(b)["hirer"] += 1
+                        ensure(a)["hired_person"] += 1
+                    elif relation == "FOUNDED":
+                        ensure(b)["agent_person_like"] += 1
+                        ensure(a)["founded_org"] += 1
+                    elif relation == "AUTHORED":
+                        ensure(b)["agent_person_like"] += 1
+                        ensure(a)["authored_work"] += 1
+                    else:  # DEVELOPED, INTEGRATED_INTO
+                        ensure(b)["agent_person_like"] += 1
+                        ensure(a)["created_thing"] += 1
 
     # also register any entity spans not involved in a relation, so they're not lost
     for _, _, phrase in spans:
@@ -167,14 +188,13 @@ async def extract_graph(req: ExtractRequest):
 
 
 def _dual_entity_regex(pattern_str: str) -> str:
-    """Replace the two occurrences of literal 'ENT' placeholder with distinct group patterns named a/b.
-    Allows an optional leading article ("the"/"a"/"an") before the captured entity, since object
-    entities are frequently introduced that way (e.g. "authored the Deep Learning textbook")."""
-    ent_pattern = r"[A-Z][a-zA-Z0-9]*(?:\s+(?:of|for|and|the|&)\s+[A-Z][a-zA-Z0-9]*|\s+[A-Z][a-zA-Z0-9]*){0,4}"
-    article = r"(?:(?i:the|a|an)\s+)?"
+    """Replace the two occurrences of literal 'ENT' placeholder with list-capable group
+    patterns named a/b, so phrases like "Tesla and SpaceX" or "the Deep Learning textbook"
+    are matched (and later split) as intended, instead of silently failing to match or
+    being merged into one bogus entity."""
     out = pattern_str
-    out = out.replace("(?P<a>ENT)", f"{article}(?P<a>{ent_pattern})")
-    out = out.replace("(?P<b>ENT)", f"{article}(?P<b>{ent_pattern})")
+    out = out.replace("(?P<a>ENT)", _list_entity_pattern("a"))
+    out = out.replace("(?P<b>ENT)", _list_entity_pattern("b"))
     return out
 
 
