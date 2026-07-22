@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from mangum import Mangum
 
-EMAIL = os.getenv("EMAIL", "student@ds.study.iitm.ac.in")
+EMAIL = os.getenv("EMAIL", "23f2004598@ds.study.iitm.ac.in")
 
 app = FastAPI(title="TDS Week4 Q5 - GraphRAG Pipeline")
 
@@ -17,6 +17,13 @@ STOPWORDS_LEADING = {
     "The", "This", "That", "These", "Those", "It", "They", "He", "She",
     "A", "An", "In", "On", "For", "With", "After", "Before", "When",
     "While", "Since", "As", "If", "But", "And", "Or", "Its",
+}
+
+# single capitalized words that are never entities on their own (months, days, etc)
+NON_ENTITY_WORDS = {
+    "January", "February", "March", "April", "May", "June", "July", "August",
+    "September", "October", "November", "December",
+    "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
 }
 
 ORG_SUFFIXES = ("Inc", "Corp", "Corporation", "Labs", "Technologies", "Systems",
@@ -52,7 +59,9 @@ def _split_entity_list(text: str) -> list:
     parts = re.split(r"\s*,\s*|\s+(?i:and)\s+", text.strip())
     cleaned = []
     for p in parts:
-        p = re.sub(r"^(?i:the|a|an)\s+", "", p.strip()).strip()
+        # strip a leading "and "/"the "/"a "/"an " left over from Oxford-comma
+        # lists ("X, Y, and Z") where the comma-split leaves "and Z" as one piece.
+        p = re.sub(r"^(?i:and|the|a|an)\s+", "", p.strip()).strip()
         if p:
             cleaned.append(p)
     return cleaned
@@ -120,8 +129,7 @@ def find_entity_spans(text: str):
     spans = []
     for m in ENTITY_RE.finditer(text):
         phrase = m.group(0)
-        first_word = phrase.split()[0]
-        if first_word in STOPWORDS_LEADING and len(phrase.split()) == 1:
+        if len(phrase.split()) == 1 and (phrase in STOPWORDS_LEADING or phrase in NON_ENTITY_WORDS):
             continue
         spans.append((m.start(), m.end(), phrase))
     return spans
@@ -171,31 +179,83 @@ async def extract_graph(req: ExtractRequest):
     relationships = []
     seen_rel = set()
 
-    for pattern_str, relation in RELATION_PATTERNS:
-        for m in re.finditer(_dual_entity_regex(pattern_str), text):
-            a_list = _split_entity_list(m.group("a"))
-            b_list = _split_entity_list(m.group("b"))
-            for b in b_list:
-                for a in a_list:
-                    if not a or not b or a == b:
-                        continue
-                    key = (a, b, relation)
-                    if key in seen_rel:
-                        continue
-                    seen_rel.add(key)
-                    relationships.append({"source": b, "target": a, "relation": relation})
-                    if relation == "HIRED":
-                        ensure(b)["hirer"] += 1
-                        ensure(a)["hired_person"] += 1
-                    elif relation == "FOUNDED":
-                        ensure(b)["agent_person_like"] += 1
-                        ensure(a)["founded_org"] += 1
-                    elif relation == "AUTHORED":
-                        ensure(b)["agent_person_like"] += 1
-                        ensure(a)["authored_work"] += 1
-                    else:  # DEVELOPED, INTEGRATED_INTO
-                        ensure(b)["agent_person_like"] += 1
-                        ensure(a)["created_thing"] += 1
+    def record(a, b, relation):
+        if not a or not b or a == b:
+            return
+        key = (a, b, relation)
+        if key in seen_rel:
+            return
+        seen_rel.add(key)
+        relationships.append({"source": b, "target": a, "relation": relation})
+        if relation == "HIRED":
+            ensure(b)["hirer"] += 1
+            ensure(a)["hired_person"] += 1
+        elif relation == "FOUNDED":
+            ensure(b)["agent_person_like"] += 1
+            ensure(a)["founded_org"] += 1
+        elif relation == "AUTHORED":
+            ensure(b)["agent_person_like"] += 1
+            ensure(a)["authored_work"] += 1
+        else:  # DEVELOPED, INTEGRATED_INTO
+            ensure(b)["agent_person_like"] += 1
+            ensure(a)["created_thing"] += 1
+
+    # Fallback keyword map: used only for sentences where none of the specific
+    # verb patterns above matched anything, so an unanticipated phrasing still
+    # contributes a linked pair instead of silently dropping it. Scoped per
+    # sentence and restricted to ADJACENT entities only, to avoid inventing
+    # spurious links between unrelated items in the same sentence (e.g. two
+    # siblings in a list, like "Tesla" and "SpaceX" in "Musk founded Tesla and
+    # SpaceX", which are already each linked to Musk and shouldn't also be
+    # linked to each other).
+    FALLBACK_KEYWORDS = {
+        "FOUNDED": ["found", "establish", "start", "launch", "incorporat", "creat", "spun", "set up"],
+        "DEVELOPED": ["develop", "build", "built", "design", "engineer", "invent", "code", "program",
+                      "creat", "release", "ship", "power"],
+        "HIRED": ["hire", "recruit", "employ", "appoint", "onboard", "join", "sign"],
+        "AUTHORED": ["author", "wrote", "written", "publish", "pen", "draft"],
+        "INTEGRATED_INTO": ["integrat", "work with", "support", "connect", "plug", "compatib",
+                             "leverag", "embed", "extend", "complement", "use", "combine", "pair", "partner"],
+    }
+
+    def guess_relation(sentence_lower: str) -> str:
+        best_relation, best_hits = "INTEGRATED_INTO", 0
+        for relation, keywords in FALLBACK_KEYWORDS.items():
+            hits = sum(1 for kw in keywords if kw in sentence_lower)
+            if hits > best_hits:
+                best_relation, best_hits = relation, hits
+        return best_relation
+
+    for sentence in re.split(r"(?<=[.!?])\s+", text):
+        if not sentence.strip():
+            continue
+
+        found_specific = False
+        for pattern_str, relation in RELATION_PATTERNS:
+            for m in re.finditer(_dual_entity_regex(pattern_str), sentence):
+                a_list = _split_entity_list(m.group("a"))
+                b_list = _split_entity_list(m.group("b"))
+                for b in b_list:
+                    for a in a_list:
+                        record(a, b, relation)
+                        found_specific = True
+
+        if found_specific:
+            continue
+
+        # no specific pattern matched this sentence -- try the adjacent-pair fallback
+        sent_spans = find_entity_spans(sentence)
+        names_in_order = []
+        seen_in_sentence = set()
+        for _, _, phrase in sent_spans:
+            if phrase not in seen_in_sentence:
+                seen_in_sentence.add(phrase)
+                names_in_order.append(phrase)
+        if len(names_in_order) < 2:
+            continue
+        relation_guess = guess_relation(sentence.lower())
+        for i in range(len(names_in_order) - 1):
+            record(names_in_order[i + 1], names_in_order[i], relation_guess)
 
     # also register any entity spans not involved in a relation, so they're not lost
     for _, _, phrase in spans:
