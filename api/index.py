@@ -63,31 +63,56 @@ def _split_entity_list(text: str) -> list:
 #
 # Convention: "b" is always the grammatical subject/agent, "a" is always the
 # grammatical object/target -- relationships are emitted as source=b, target=a.
-FOUNDED_V = "founded|co-founded|cofounded|established|started"
-DEVELOPED_V = "developed|created|built|designed|engineered|invented"
-HIRED_V = "hired|recruited|employed|appointed"
-AUTHORED_V = "authored|wrote|published|co-authored|penned"
+FOUNDED_V = "founded|co-founded|cofounded|established|started|incorporated|set up|spun out"
+DEVELOPED_V = "developed|created|built|designed|engineered|invented|coded|programmed|released|shipped"
+HIRED_V = "hired|recruited|employed|appointed|onboarded|signed"
+AUTHORED_V = "authored|wrote|published|co-authored|penned|co-wrote|drafted"
 INTEGRATED_V = "integrates|integrated"
 WORKS_V = "works|worked"
+ROLE_NOUN = "framework|product|tool|library|platform|company|startup|app|service|model"
 
-RELATION_PATTERNS = [
+# optional short lowercase-led comma aside between a subject and its verb, e.g.
+# "LangChain, Harrison Chase's framework, integrates with OpenAI" -- the aside
+# must start with a lowercase word (article/pronoun/etc) to avoid swallowing a
+# genuine list of capitalized entities as if it were a descriptive aside.
+ASIDE = (
+    r"(?:,\s*(?:[a-z][a-z '\-]{1,60}"
+    rf"|{SINGLE_ENT_PATTERN}('s|s')\s[a-z][a-z '\-]{{0,50}}),)?\s+"
+)
+
+# (subject-first "b VERB a" pattern, relation) -- an aside-tolerant variant of
+# each is generated automatically below.
+_ACTIVE_CORE = [
     (rf"(?P<b>ENT) (?i:{FOUNDED_V}) (?P<a>ENT)", "FOUNDED"),
-    (rf"(?P<a>ENT) (?i:was (?:{FOUNDED_V}) by) (?P<b>ENT)", "FOUNDED"),
-
     (rf"(?P<b>ENT) (?i:{DEVELOPED_V}) (?P<a>ENT)", "DEVELOPED"),
-    (rf"(?P<a>ENT) (?i:was (?:{DEVELOPED_V}) by) (?P<b>ENT)", "DEVELOPED"),
-    (rf"(?P<a>ENT), (?i:an?|the) [a-z ]*? (?i:{DEVELOPED_V}) by (?P<b>ENT)", "DEVELOPED"),
-
     (rf"(?P<b>ENT) (?i:{INTEGRATED_V}) (?i:with|into) (?P<a>ENT)", "INTEGRATED_INTO"),
-    (rf"(?P<a>ENT) (?i:is|was) (?i:{INTEGRATED_V}) into (?P<b>ENT)", "INTEGRATED_INTO"),
     (rf"(?P<b>ENT) (?i:{WORKS_V}) with (?P<a>ENT)", "INTEGRATED_INTO"),
     (rf"(?P<b>ENT) (?i:supports|connects to|plugs into|is compatible with) (?P<a>ENT)", "INTEGRATED_INTO"),
-
     (rf"(?P<b>ENT) (?i:{HIRED_V}) (?P<a>ENT)", "HIRED"),
-    (rf"(?P<a>ENT) (?i:was (?:{HIRED_V}) by) (?P<b>ENT)", "HIRED"),
-
     (rf"(?P<b>ENT) (?i:{AUTHORED_V}) (?P<a>ENT)", "AUTHORED"),
+]
+
+RELATION_PATTERNS = []
+for _pat, _rel in _ACTIVE_CORE:
+    RELATION_PATTERNS.append((_pat, _rel))
+    RELATION_PATTERNS.append((_pat.replace("(?P<b>ENT) ", f"(?P<b>ENT){ASIDE}"), _rel))
+
+RELATION_PATTERNS += [
+    (rf"(?P<a>ENT) (?i:was (?:{FOUNDED_V}) by) (?P<b>ENT)", "FOUNDED"),
+    (rf"(?P<a>ENT) (?i:was (?:{DEVELOPED_V}) by) (?P<b>ENT)", "DEVELOPED"),
+    (rf"(?P<a>ENT), (?i:an?|the) [a-z ]*? (?i:{DEVELOPED_V}) by (?P<b>ENT)", "DEVELOPED"),
+    (rf"(?P<a>ENT) (?i:is|was) (?i:{INTEGRATED_V}) into (?P<b>ENT)", "INTEGRATED_INTO"),
+    (rf"(?P<a>ENT) (?i:was (?:{HIRED_V}) by) (?P<b>ENT)", "HIRED"),
     (rf"(?P<a>ENT) (?i:was (?:authored|written) by) (?P<b>ENT)", "AUTHORED"),
+
+    # possessive / appositive constructions common in bios and profiles
+    (rf"(?P<b>ENT)('s| s) (?i:{ROLE_NOUN}) (?P<a>ENT)", "DEVELOPED"),
+    (rf"(?P<a>ENT), (?P<b>ENT)('s| s) (?i:{ROLE_NOUN})", "DEVELOPED"),
+    (rf"(?P<b>ENT), (?i:the |a |an )?(?i:founder|co-founder) of (?P<a>ENT)", "FOUNDED"),
+    (rf"(?P<a>ENT)('s| s) (?i:founder|co-founder),? (?P<b>ENT)", "FOUNDED"),
+    (rf"(?P<b>ENT), (?i:the |a |an )?(?i:creator|developer) of (?P<a>ENT)", "DEVELOPED"),
+    (rf"(?P<a>ENT)('s| s) (?i:creator|developer),? (?P<b>ENT)", "DEVELOPED"),
+    (rf"(?P<b>ENT), (?i:the |a |an )?(?i:author) of (?P<a>ENT)", "AUTHORED"),
 ]
 
 
